@@ -1,0 +1,125 @@
+- hosts: AS400
+  gather_facts: false
+  vars:
+    index_name: "clc_jrnrcv"
+    bulk_header: "{ \"index\" : { \"_index\" : \"{{ index_name }}\" } }"
+  collections:
+    - ibm.power_ibmi
+
+  tasks:
+  - name: run the SQL command to query a table
+    ibmi_sql_query:
+      sql: "WITH RankedRecords AS 
+            ( SELECT CAST(q.OBHLBL AS VARCHAR(100) CCSID  
+            37) AS JOURNAL_RECEIVER_LIBRARY, CAST(q.OBHNAM AS VARCHAR(100)      
+            CCSID 37) AS JOURNAL_RECEIVER_NAME, ROW_NUMBER() OVER (ORDER BY     
+            q.OBHNAM ASC) AS rn_asc, ROW_NUMBER() OVER (ORDER BY q.OBHNAM DESC) 
+            AS rn_desc FROM QUSRBRM.QA1AOD q LEFT JOIN QUSRBRM.MEDIA_INFO m ON  
+            q.obvol = m.VOLUME_IDENTIFIER WHERE m.MEDIA_CLASS = 'JRNSAVE8' AND  
+            m.VOLUME_STATUS = 'ACTIVE' AND SUBSTRING(OBHSVT, 2, 6) <=           
+            int(RIGHT(replace(char(CURRENT_DATE - 7 DAY, ISO), '-', ''), 6))    
+            AND SUBSTRING(OBHSVT, 2, 6) > int(RIGHT(replace(char(CURRENT_DATE - 
+            14 DAY, ISO), '-', ''), 6)) ), 
+            FirstLastNames AS ( SELECT MAX(CASE  
+            WHEN rn_asc = 1 THEN JOURNAL_RECEIVER_NAME END) AS                  
+            FIRST_JOURNAL_RECEIVER_NAME, MAX(CASE WHEN rn_desc = 1 THEN         
+            JOURNAL_RECEIVER_NAME END) AS LAST_JOURNAL_RECEIVER_NAME FROM       
+            RankedRecords ) 
+            SELECT r.JOURNAL_RECEIVER_LIBRARY,                  
+            r.JOURNAL_RECEIVER_NAME , f.FIRST_JOURNAL_RECEIVER_NAME,            
+            f.LAST_JOURNAL_RECEIVER_NAME FROM RankedRecords r cross JOIN        
+            FirstLastNames f order by r.JOURNAL_RECEIVER_NAME"
+    register: sql_query_result
+    when: inventory_hostname == '172.16.222.67'
+
+  - name: Send POST request to Elasticsearch
+    uri:
+      url: http://172.16.243.154:9200/clc_jrnrcv
+      method: PUT
+      body:  '{"settings": {"default_pipeline": "my_timestamp_pipeline"}}'
+      headers:
+        Content-Type: "application/json"
+    register: response
+    ignore_errors: yes
+    when: inventory_hostname == '172.16.222.67'
+
+  - name: Transform DB2 records to Elasticsearch bulk format
+    set_fact:
+      bulk_data: "{{ bulk_data | default('') + bulk_header|to_json  + '\n' + item | to_json + '\n' }}"
+    loop: "{{ sql_query_result.row }}"
+    vars:
+      bulk_data: ""
+    when: inventory_hostname == '172.16.222.67'  
+
+  - name: Send POST request to Elasticsearch
+    uri:
+      url: http://172.16.243.154:9200/_bulk
+      method: POST
+      body_format: json
+      body: "{{ bulk_data }}"
+      headers:
+        Content-Type: "application/x-ndjson"
+    register: response1
+    when: inventory_hostname == '172.16.222.67'
+
+  #- name: Process SQL query result
+  #  set_fact:
+  #    result_string: "{{ hostvars['172.16.222.67'].sql_query_result.row | map(attribute='JOURNAL_RECEIVER_NAME') | join('\n') }}"
+  #  when: inventory_hostname == '172.16.222.70'
+
+  - name: Process SQL query result
+    set_fact:
+      fist: "{{ hostvars['172.16.222.67'].sql_query_result.row | map(attribute='FIRST_JOURNAL_RECEIVER_NAME') | list | unique  }}"
+    when: inventory_hostname == '172.16.222.70'
+
+  - name: Process SQL query result
+    set_fact:
+      last: "{{ hostvars['172.16.222.67'].sql_query_result.row | map(attribute='LAST_JOURNAL_RECEIVER_NAME') | list | unique  }}"
+    when: inventory_hostname == '172.16.222.70'
+
+  - name: run the SQL command to query a table
+    ibmi_sql_query:
+      sql: "SELECT min(ATTACH_TIMESTAMP) as min ,max(DETACH_TIMESTAMP) as max
+            FROM QSYS2.JOURNAL_RECEIVER_INFO WHERE JOURNAL_RECEIVER_LIBRARY =
+            'WMCHNBASD' AND JOURNAL_RECEIVER_NAME BETWEEN '{{fist[0]}}' AND       
+             '{{last[0]}}'"
+    register: sql_query_result1
+    when: inventory_hostname == '172.16.222.70'
+
+  - name: Process SQL query result
+    set_fact:
+      min: "{{ sql_query_result1.row | map(attribute='MIN') }}"
+    when: inventory_hostname == '172.16.222.70'
+
+  - name: Process SQL query result
+    set_fact:
+      max: "{{ sql_query_result1.row | map(attribute='MAX')}}"
+    when: inventory_hostname == '172.16.222.70'
+
+  #- name: Format msg
+  #  set_fact:
+  #    message_data: '{"msgtype": "text","text": { "content": "Weekly reminder-please noted that CLC below last week journal reciever will be removed \n{{result_string}} \n You can also check from below Grafana link \n http://172.16.243.147:3000/d/ab02385f-d9da-4212-9fdb-2083bd4f466e/gary?orgId=1" }}'
+  #  when: inventory_hostname == '172.16.222.70'  
+
+  - name: Format msg
+    set_fact:
+      message_data: '{"msgtype": "text","text": { "content": "Weekly reminder---Please noted that below CLC last week journal reciever from {{min}} to {{max}} will be removed \n" }}'
+    when: inventory_hostname == '172.16.222.70'
+
+  - name: Send POST request to qiyeweixin
+    uri:
+      url: https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=0747913a-4b34-40b0-9686-97eabc198dae
+      method: POST
+      body_format: json
+      body: "{{ message_data }}"
+      headers:
+        Content-Type: "application/json"
+    register: response1
+    when: inventory_hostname == '172.16.222.70'  
+
+  - name: delete journal receiver
+    ibmi_cl_command: 
+      cmd: QSYS/DLTJRNRCV JRNRCV({{item.JOURNAL_RECEIVER_LIBRARY|trim}}/{{item.JOURNAL_RECEIVER_NAME|trim}}) DLTOPT(*IGNINQMSG) 
+    loop: "{{ hostvars['172.16.222.67'].sql_query_result.row }}"
+    ignore_errors: yes
+    when: inventory_hostname == '172.16.222.70'

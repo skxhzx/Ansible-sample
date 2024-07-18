@@ -1,0 +1,61 @@
+- hosts: AS400
+  gather_facts: false
+  vars:
+    index_name: "clc_source"
+    bulk_header: "{ \"index\" : { \"_index\" : \"{{ index_name }}\" } }"
+  collections:
+    - ibm.power_ibmi
+
+  tasks:
+  - name: run the SQL command to query a table
+    ibmi_sql_query:
+      sql: "SELECT TABLE_SCHEMA, TABLE_NAME, TABLE_PARTITION, SOURCE_TYPE ,   
+              LAST_CHANGE_TIMESTAMP FROM QSYS2.SYSPARTITIONSTAT WHERE           
+              SYSTEM_TABLE_SCHEMA = 'WMCHNMODS' AND SYSTEM_TABLE_NAME IN(       
+              'QRPGLESRC' ,'QDDSSRC', 'QCLLESRC') AND LAST_CHANGE_TIMESTAMP >   
+              (CURRENT TIMESTAMP -7 DAYS)"
+    register: sql_query_result
+
+  - name: Send POST request to Elasticsearch
+    uri:
+      url: http://172.16.243.154:9200/clc_source
+      method: PUT
+      body:  '{"settings": {"default_pipeline": "my_timestamp_pipeline"}}'
+      headers:
+        Content-Type: "application/json"
+    register: response
+    ignore_errors: yes
+
+  - name: Transform DB2 records to Elasticsearch bulk format
+    set_fact:
+      bulk_data: "{{ bulk_data | default('') + bulk_header|to_json  + '\n' + item | to_json + '\n' }}"
+    loop: "{{ sql_query_result.row }}"
+    vars:
+      bulk_data: ""
+
+  - name: Send POST request to Elasticsearch
+    uri:
+      url: http://172.16.243.154:9200/_bulk
+      method: POST
+      body_format: json
+      body: "{{ bulk_data }}"
+      headers:
+        Content-Type: "application/x-ndjson"
+    register: response1
+
+  - name: Format msg
+    set_fact:
+      message_data: '{"msgtype": "text","text": { "content": "Weekly reminder-please check CLC last week source change as below Grafana link! \n http://172.16.243.147:3000/d/ab02385f-d9da-4212-9fdb-2083bd4f466e/gary?orgId=1" }}'
+
+
+  - name: Send POST request to qiyeweixin
+    uri:
+      url: https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=0747913a-4b34-40b0-9686-97eabc198dae
+      method: POST
+      body_format: json
+      body: "{{ message_data }}"
+      headers:
+        Content-Type: "application/json"
+    register: response1
+
+  - debug: var=response1
